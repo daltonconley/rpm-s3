@@ -10,6 +10,7 @@ import shutil
 import optparse
 import logging
 import collections
+import ConfigParser
 import yum
 import boto
 import subprocess
@@ -38,12 +39,12 @@ class LoggerCallback(object):
 
 
 class S3Grabber(object):
-    def __init__(self, baseurl, visibility, region):
+    def __init__(self, baseurl, visibility, region, profile):
         logging.info('S3Grabber: %s', baseurl)
         base = urlparse.urlsplit(baseurl)
         self.baseurl = baseurl
         self.basepath = base.path.lstrip('/')
-        self.bucket = getclient(base, region)
+        self.bucket = getclient(base, region, profile)
         self.visibility = visibility
 
     def check(self, url):
@@ -106,17 +107,46 @@ class FileGrabber(object):
         return filename
 
 
-def getclient(base, region):
+class Credentials(object):
+    '''
+    Credentials object to manage AWS access keys, and session tokens for temporary credentials, since
+    boto doesn't seem to offer support for parsing security tokens in the default credentials file
+    '''
+    def __init__(self, profile):
+        user_home = os.path.expanduser('~')
+        credential_file_path = '{0}{1}.aws{2}credentials'.format(user_home, os.path.sep, os.path.sep)
+        config_parser = ConfigParser.RawConfigParser()
+        config_parser.read(credential_file_path)
+        self.aws_access_key_id = config_parser.get(profile, 'aws_access_key_id')
+        self.aws_secret_access_key = config_parser.get(profile, 'aws_secret_access_key')
+
+        if config_parser.has_option(profile, 'aws_session_token'):
+            self.aws_session_token = config_parser.get(profile, 'aws_session_token')
+        else:
+            self.aws_session_token = None
+	
+
+def getclient(base, region, profile):
     if os.getenv('AWS_ACCESS_KEY'):
         return boto.connect_s3(
             os.getenv('AWS_ACCESS_KEY'),
             os.getenv('AWS_SECRET_KEY'),
-            host="s3-{}.amazonaws.com".format(region)
+            host="s3-{0}.amazonaws.com".format(region)
         ).get_bucket(base.netloc)
     else:
-        return boto.connect_s3(
-            host="s3-{}.amazonaws.com".format(region)
-        ).get_bucket(base.netloc)
+        credentials = Credentials(profile)
+
+        if credentials.aws_session_token is not None:
+            return boto.connect_s3(
+                credentials.aws_access_key_id,
+                credentials.aws_secret_access_key,
+                security_token=credentials.aws_session_token,
+                host="s3-{0}.amazonaws.com".format(region)
+            ).get_bucket(base.netloc)
+        else:
+            return boto.connect_s3(
+                host="s3-{0}.amazonaws.com".format(region)
+            ).get_bucket(base.netloc)
 
 
 def sign(rpmfile):
@@ -160,7 +190,7 @@ def update_repodata(repopath, rpmfiles, options):
     logging.info('rpmfiles: %s', rpmfiles)
     tmpdir = tempfile.mkdtemp()
     s3base = urlparse.urlunsplit(('s3', options.bucket, repopath, '', ''))
-    s3grabber = S3Grabber(s3base, options.visibility, options.region)
+    s3grabber = S3Grabber(s3base, options.visibility, options.region, options.profile)
     filegrabber = FileGrabber("file://" + os.getcwd())
 
     # Set up temporary repo that will fetch repodata from s3
@@ -257,5 +287,6 @@ if __name__ == '__main__':
     parser.add_option('-l', '--logfile')
     parser.add_option('-d', '--delete', action='store_true', default=False)
     parser.add_option('-r', '--region', default='eu-central-1')
+    parser.add_option('--profile', default='default')
     options, args = parser.parse_args()
     main(options, args)
